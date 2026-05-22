@@ -1,0 +1,61 @@
+{
+  "info": {
+    "_postman_id": "5d4a8d0a-9c1e-4f6b-9b2c-d51b8b6a2401",
+    "name": "order-service contract",
+    "description": "Order team's functional test. Places an order via POST /orders and asserts on the response — that's a REAL functional assertion against the order workflow (which internally requires auth + Kafka), not a /health ping. When auth is down, order returns 502 and the status assertion fails clearly.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:3002", "type": "string" },
+    { "key": "orderId", "value": "", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "POST /orders — place a real order",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "const id = `order-${Date.now()}-${Math.floor(Math.random()*1000)}`;",
+              "pm.collectionVariables.set('orderId', id);",
+              "console.log('order id for this run:', id);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "type": "text/javascript",
+            "exec": [
+              "pm.test('order-service accepted the order (HTTP 201)', function () {",
+              "    pm.response.to.have.status(201);",
+              "});",
+              "pm.test('response confirms the order was placed', function () {",
+              "    const body = pm.response.json();",
+              "    pm.expect(body.id).to.equal(pm.collectionVariables.get('orderId'));",
+              "    pm.expect(body.status).to.equal('placed');",
+              "});"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          { "key": "Content-Type", "value": "application/json" }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"id\": \"{{orderId}}\",\n  \"item\": \"widget\",\n  \"qty\": 1\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/orders",
+          "host": ["{{baseUrl}}"],
+          "path": ["orders"]
+        }
+      }
+    }
+  ]
+}
