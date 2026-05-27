@@ -17,8 +17,8 @@ spec:
     spec:
       containers:
         - name: order
-          image: order-demo-order:local
-          imagePullPolicy: Never
+          image: ghcr.io/neuralnimbus22/order-demo-order:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 3002

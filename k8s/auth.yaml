@@ -22,8 +22,8 @@ spec:
       terminationGracePeriodSeconds: 5
       containers:
         - name: auth
-          image: order-demo-auth:local
-          imagePullPolicy: Never
+          image: ghcr.io/neuralnimbus22/order-demo-auth:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 3001

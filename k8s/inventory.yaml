@@ -17,8 +17,8 @@ spec:
     spec:
       containers:
         - name: inventory
-          image: order-demo-inventory:local
-          imagePullPolicy: Never
+          image: ghcr.io/neuralnimbus22/order-demo-inventory:latest
+          imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 3003

@@ -34,7 +34,7 @@ inventory-service    (downstream "edge" — its test fails first)
 | `services/*/Dockerfile` | All `node:20-alpine`, `npm install --omit=dev`, run as USER `node`. |
 | `kafka/kafka.yaml` | `apache/kafka:3.7.0` KRaft single-node combined mode (broker+controller), `emptyDir` storage, auto-create-topics enabled. |
 | `k8s/namespace.yaml` | Creates `order-demo`. |
-| `k8s/{auth,order,inventory}.yaml` | Deployment + Service for each. Images `order-demo-{auth,order,inventory}:local`, `imagePullPolicy: Never`. Auth has `terminationGracePeriodSeconds: 5`. |
+| `k8s/{auth,order,inventory}.yaml` | Deployment + Service for each. Images `ghcr.io/neuralnimbus22/order-demo-{auth,order,inventory}:latest` (public GHCR), `imagePullPolicy: IfNotPresent`. Auth has `terminationGracePeriodSeconds: 5`. |
 | `tests/auth/test_auth.py` | pytest. Genuinely calls auth `/authorize`; fails with "AUTH-SERVICE UNREACHABLE" on connection error. |
 | `tests/order/order.postman_collection.json` | Newman. Real `POST /orders` with assertions on `201` + `status:"placed"`. Fails with "expected 201 got 502" when auth is down. |
 | `tests/inventory/test_inventory.py` | pytest. Places an order then polls `/processed/:id`. **Does not abort on order-side errors** — the inventory team's only verdict is "did the message arrive?". Failure message starts with `MESSAGE NEVER ARRIVED`. |
@@ -45,11 +45,13 @@ inventory-service    (downstream "edge" — its test fails first)
 | `testkube/README.md` | Intentionally empty marker — TestWorkflows are built by hand outside this repo. |
 
 ## How to run / deploy
-**Build images locally (Docker Desktop k8s uses `dockerd`, so local images work with `imagePullPolicy: Never`):**
+**Build images locally** (tag with the GHCR path so `IfNotPresent` uses your local build without pulling — fresh machines pull from GHCR automatically):
 ```bash
-cd services/auth      && docker build -t order-demo-auth:local .
-cd ../order           && docker build -t order-demo-order:local .
-cd ../inventory       && docker build -t order-demo-inventory:local .
+cd services/auth      && docker build -t ghcr.io/neuralnimbus22/order-demo-auth:latest .
+cd ../order           && docker build -t ghcr.io/neuralnimbus22/order-demo-order:latest .
+cd ../inventory       && docker build -t ghcr.io/neuralnimbus22/order-demo-inventory:latest .
+# Optional: push to GHCR to share with other clusters
+# docker push ghcr.io/neuralnimbus22/order-demo-auth:latest   (etc.)
 ```
 
 **Deploy everything to k8s:**
@@ -94,7 +96,7 @@ npx --yes newman run tests/order/order.postman_collection.json \
 
 ## Conventions / gotchas
 - **Namespace is `order-demo`** for the workload; the TestKube agent (where orchestrator runs) lives elsewhere — this repo doesn't deploy it.
-- **Image tags are local-only** (`order-demo-*:local`, `imagePullPolicy: Never`). Don't push to a registry.
+- **Images come from public GHCR** (`ghcr.io/neuralnimbus22/order-demo-{auth,order,inventory}:latest`) with `imagePullPolicy: IfNotPresent`. Clusters without the image cached pull from GHCR automatically. For local iteration, build with the same ghcr-prefixed tag and the kubelet uses your local build instead of pulling.
 - **Tests must run in different frameworks on purpose** (pytest / Newman / pytest). The tool heterogeneity is what proves the future orchestrator is tool-agnostic.
 - **Inventory test does NOT fail on order-side errors** — it logs them and proceeds. The only verdict is "message arrived?". This makes the symptom the orchestrator sees clean and consistent ("MESSAGE NEVER ARRIVED"), regardless of where upstream broke.
 - **`break-auth.sh` returns ONLY after cascade is observable** — `POST /orders → 502` is confirmed via probe. No race window for the next step.
@@ -105,7 +107,7 @@ npx --yes newman run tests/order/order.postman_collection.json \
 - **No TestKube content in this repo.** `testkube/` is intentionally empty; orchestration lives outside.
 
 ## Common tasks
-- **Modify a service** → edit `services/<name>/server.js`, rebuild that image (`docker build -t order-demo-<name>:local .`), `kubectl -n order-demo rollout restart deploy/<name>`.
+- **Modify a service** → edit `services/<name>/server.js`, rebuild (`docker build -t ghcr.io/neuralnimbus22/order-demo-<name>:latest .`), `kubectl -n order-demo rollout restart deploy/<name>`. To publish for other clusters: `docker push ghcr.io/neuralnimbus22/order-demo-<name>:latest`.
 - **Tune the cascade demo timing** → `WAIT_TIMEOUT_S`, `HEALTHY_POLL_TIMEOUT_S`, `INVENTORY_POLL_TIMEOUT_S` env vars in the relevant scripts/tests.
 - **Add a new test in a different framework** → drop it in `tests/<framework>/`. Use env vars for URLs (`AUTH_URL`, `ORDER_URL`, `INVENTORY_URL`). Don't bake in invocation assumptions — the orchestrator wraps it later.
 - **Reset state after a failed run** → `./scripts/restore.sh` (idempotent — works whether auth was down or up).
