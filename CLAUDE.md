@@ -1,0 +1,112 @@
+# CLAUDE.md — order-management-demo-upstream
+
+## What this is
+A three-service demo whose purpose is to make **upstream root-cause confirmation** visible end to end. The downstream test fails first (with a clear "message never arrived" symptom); an orchestrator (built **outside this repo**, in TestKube) walks back along the real dependency chain and confirms which boundary actually broke. The application here is deliberately decoupled from how it gets tested so the orchestration layer can be reasoned about on its own. See `ARCHITECTURE.md` for the deeper story.
+
+## Architecture
+```
+auth-service         (deepest upstream — the one we break)
+     │  order calls auth /authorize before doing anything
+     ▼
+order-service        (middle — victim AND producer)
+     │  publishes "order-placed" event
+     ▼
+[ Kafka topic: order-placed ]   ← boundary where the cause goes invisible
+     │  inventory consumes it
+     ▼
+inventory-service    (downstream "edge" — its test fails first)
+```
+**Failure flows down. The deepest upstream break is the true cause.**
+- All three services are Node.js + Express. Order + inventory use `kafkajs`. Auth is pure HTTP.
+- Kafka runs single-node KRaft (no Zookeeper) inside the cluster.
+- All in namespace **`order-demo`**.
+
+### Non-negotiable correctness rules (encoded in code, not in tests)
+- `order` genuinely calls `auth` over HTTP before publishing. If `auth` is unreachable, `order` returns `502` and **never** calls `producer.send`. No fallback path.
+- `inventory` genuinely consumes from Kafka. If no message arrives, the test genuinely times out — no synthetic assertion shortcut.
+
+## Key directories
+| Path | Contents |
+|---|---|
+| `services/auth/server.js` | `POST /authorize` always `200 {authorized:true}`; failure modeled by scaling the deployment to 0. Has SIGTERM handler for fast termination. |
+| `services/order/server.js` | `POST /orders` → real `fetch` to `${AUTH_URL}/authorize` (2s timeout) → only on success calls `producer.send` on topic `order-placed`. |
+| `services/inventory/server.js` | Express `/health` + `/processed/:id` AND a `kafkajs` consumer (group `inventory-service`, `fromBeginning: true`) in the same process. In-memory `Map` records processed ids. |
+| `services/*/Dockerfile` | All `node:20-alpine`, `npm install --omit=dev`, run as USER `node`. |
+| `kafka/kafka.yaml` | `apache/kafka:3.7.0` KRaft single-node combined mode (broker+controller), `emptyDir` storage, auto-create-topics enabled. |
+| `k8s/namespace.yaml` | Creates `order-demo`. |
+| `k8s/{auth,order,inventory}.yaml` | Deployment + Service for each. Images `order-demo-{auth,order,inventory}:local`, `imagePullPolicy: Never`. Auth has `terminationGracePeriodSeconds: 5`. |
+| `tests/auth/test_auth.py` | pytest. Genuinely calls auth `/authorize`; fails with "AUTH-SERVICE UNREACHABLE" on connection error. |
+| `tests/order/order.postman_collection.json` | Newman. Real `POST /orders` with assertions on `201` + `status:"placed"`. Fails with "expected 201 got 502" when auth is down. |
+| `tests/inventory/test_inventory.py` | pytest. Places an order then polls `/processed/:id`. **Does not abort on order-side errors** — the inventory team's only verdict is "did the message arrive?". Failure message starts with `MESSAGE NEVER ARRIVED`. |
+| `scripts/break-auth.sh` | Scales auth → 0 and waits until cascade is observable (POST /orders returns 502). Typical 2–5s, capped by `WAIT_TIMEOUT_S=30`. |
+| `scripts/restore.sh` | Scales auth → 1, deletes + recreates topic, restarts inventory (wipes in-memory Map), verifies with a real order, then resets topic + inventory ONCE MORE so HWM=0. |
+| `scripts/sanity-check.sh` | Per-deployment health + topic existence + topic high-water-mark. `[OK]/[WARN]/[FAIL]` markers. |
+| `scripts/place-order.sh` | Healthy-path helper: place one order, confirm inventory processed it. |
+| `testkube/README.md` | Intentionally empty marker — TestWorkflows are built by hand outside this repo. |
+
+## How to run / deploy
+**Build images locally (Docker Desktop k8s uses `dockerd`, so local images work with `imagePullPolicy: Never`):**
+```bash
+cd services/auth      && docker build -t order-demo-auth:local .
+cd ../order           && docker build -t order-demo-order:local .
+cd ../inventory       && docker build -t order-demo-inventory:local .
+```
+
+**Deploy everything to k8s:**
+```bash
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f kafka/
+kubectl apply -f k8s/
+kubectl -n order-demo rollout status deploy/kafka
+# Pre-create the topic (consumer subscribe fails if topic doesn't exist yet):
+kubectl -n order-demo exec deploy/kafka -- /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --create --if-not-exists \
+  --topic order-placed --partitions 1 --replication-factor 1
+# Restart order + inventory if they came up before Kafka was ready:
+kubectl -n order-demo rollout restart deploy/order deploy/inventory
+```
+
+**Sanity check:** `./scripts/sanity-check.sh` → expects all `[OK]`.
+
+**Demo cycle (run from outside the cluster — scripts handle port-forwards themselves):**
+```bash
+./scripts/place-order.sh    # green-path proof
+./scripts/break-auth.sh     # take auth down + wait for cascade
+# … run downstream test or your orchestrator here …
+./scripts/restore.sh        # bring auth back, reset state, verify
+```
+
+**Run a test standalone (port-forward first):**
+```bash
+kubectl -n order-demo port-forward svc/auth      13001:3001 &
+kubectl -n order-demo port-forward svc/order     13002:3002 &
+kubectl -n order-demo port-forward svc/inventory 13003:3003 &
+
+# pytest (deps in tests/auth/requirements.txt or tests/inventory/requirements.txt)
+AUTH_URL=http://localhost:13001 pytest tests/auth/test_auth.py -v
+ORDER_URL=http://localhost:13002 INVENTORY_URL=http://localhost:13003 \
+  pytest tests/inventory/test_inventory.py -v
+
+# newman
+npx --yes newman run tests/order/order.postman_collection.json \
+  --env-var baseUrl=http://localhost:13002
+```
+
+## Conventions / gotchas
+- **Namespace is `order-demo`** for the workload; the TestKube agent (where orchestrator runs) lives elsewhere — this repo doesn't deploy it.
+- **Image tags are local-only** (`order-demo-*:local`, `imagePullPolicy: Never`). Don't push to a registry.
+- **Tests must run in different frameworks on purpose** (pytest / Newman / pytest). The tool heterogeneity is what proves the future orchestrator is tool-agnostic.
+- **Inventory test does NOT fail on order-side errors** — it logs them and proceeds. The only verdict is "message arrived?". This makes the symptom the orchestrator sees clean and consistent ("MESSAGE NEVER ARRIVED"), regardless of where upstream broke.
+- **`break-auth.sh` returns ONLY after cascade is observable** — `POST /orders → 502` is confirmed via probe. No race window for the next step.
+- **`restore.sh` resets all three state layers** — Kafka log (topic delete + recreate), consumer offset (inventory restart), in-memory `processed` Map (inventory restart). Skipping any layer can cause false passes.
+- **Auth has a SIGTERM handler + `terminationGracePeriodSeconds: 5`** in `k8s/auth.yaml`. Without these, the default 30s grace period made the cascade take ~31s instead of ~2–5s.
+- **Kafka consumer + auto-create-topics interaction**: auto-create fires on PRODUCE, not SUBSCRIBE. If inventory starts before any order is published, its subscribe errors. Fix: pre-create the topic (the bring-up commands above do this).
+- **Scripts use port-forwards internally** — they assume a working `kubectl` and proper cluster context. No external load balancer needed.
+- **No TestKube content in this repo.** `testkube/` is intentionally empty; orchestration lives outside.
+
+## Common tasks
+- **Modify a service** → edit `services/<name>/server.js`, rebuild that image (`docker build -t order-demo-<name>:local .`), `kubectl -n order-demo rollout restart deploy/<name>`.
+- **Tune the cascade demo timing** → `WAIT_TIMEOUT_S`, `HEALTHY_POLL_TIMEOUT_S`, `INVENTORY_POLL_TIMEOUT_S` env vars in the relevant scripts/tests.
+- **Add a new test in a different framework** → drop it in `tests/<framework>/`. Use env vars for URLs (`AUTH_URL`, `ORDER_URL`, `INVENTORY_URL`). Don't bake in invocation assumptions — the orchestrator wraps it later.
+- **Reset state after a failed run** → `./scripts/restore.sh` (idempotent — works whether auth was down or up).
+- **Debug "test fails but I don't know why"** → start at the downstream test's failure message, then walk back: `kubectl -n order-demo get pods,endpoints`, `kubectl -n order-demo logs deploy/inventory`, `kubectl -n order-demo exec deploy/kafka -- /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server localhost:9092 --topic order-placed --time -1`.
