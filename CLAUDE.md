@@ -38,6 +38,7 @@ inventory-service    (downstream "edge" — its test fails first)
 | `tests/auth/test_auth.py` | pytest. Genuinely calls auth `/authorize`; fails with "AUTH-SERVICE UNREACHABLE" on connection error. |
 | `tests/order/order.postman_collection.json` | Newman. Real `POST /orders` with assertions on `201` + `status:"placed"`. Fails with "expected 201 got 502" when auth is down. |
 | `tests/inventory/test_inventory.py` | pytest. Places an order then polls `/processed/:id`. **Does not abort on order-side errors** — the inventory team's only verdict is "did the message arrive?". Failure message starts with `MESSAGE NEVER ARRIVED`. |
+| `scripts/deploy.sh` | **One-command bring-up.** namespace → Kafka + wait → topic pre-create → services + wait → rollout-restart order/inventory (Kafka race) → sanity-check. Idempotent. |
 | `scripts/break-auth.sh` | Scales auth → 0 and waits until cascade is observable (POST /orders returns 502). Typical 2–5s, capped by `WAIT_TIMEOUT_S=30`. |
 | `scripts/restore.sh` | Scales auth → 1, deletes + recreates topic, restarts inventory (wipes in-memory Map), verifies with a real order, then resets topic + inventory ONCE MORE so HWM=0. |
 | `scripts/sanity-check.sh` | Per-deployment health + topic existence + topic high-water-mark. `[OK]/[WARN]/[FAIL]` markers. |
@@ -54,17 +55,21 @@ cd ../inventory       && docker build -t ghcr.io/neuralnimbus22/order-demo-inven
 # docker push ghcr.io/neuralnimbus22/order-demo-auth:latest   (etc.)
 ```
 
-**Deploy everything to k8s:**
+**Deploy everything to k8s (one command):**
+```bash
+./scripts/deploy.sh
+```
+What it does, in order: applies `k8s/namespace.yaml` → applies `kafka/` and waits for Kafka Available → pre-creates the `order-placed` topic (auto-create only fires on first PRODUCE, so consumers need this) → applies `k8s/` (auth + order + inventory) → waits for all three Deployments Available → rollout-restarts order + inventory to clear the Kafka client race → runs `scripts/sanity-check.sh`. Idempotent.
+
+If you'd rather apply manually:
 ```bash
 kubectl apply -f k8s/namespace.yaml
 kubectl apply -f kafka/
-kubectl apply -f k8s/
-kubectl -n order-demo rollout status deploy/kafka
-# Pre-create the topic (consumer subscribe fails if topic doesn't exist yet):
+kubectl -n order-demo wait --for=condition=available --timeout=180s deploy/kafka
 kubectl -n order-demo exec deploy/kafka -- /opt/kafka/bin/kafka-topics.sh \
   --bootstrap-server localhost:9092 --create --if-not-exists \
   --topic order-placed --partitions 1 --replication-factor 1
-# Restart order + inventory if they came up before Kafka was ready:
+kubectl apply -f k8s/
 kubectl -n order-demo rollout restart deploy/order deploy/inventory
 ```
 
@@ -103,6 +108,7 @@ npx --yes newman run tests/order/order.postman_collection.json \
 - **`restore.sh` resets all three state layers** — Kafka log (topic delete + recreate), consumer offset (inventory restart), in-memory `processed` Map (inventory restart). Skipping any layer can cause false passes.
 - **Auth has a SIGTERM handler + `terminationGracePeriodSeconds: 5`** in `k8s/auth.yaml`. Without these, the default 30s grace period made the cascade take ~31s instead of ~2–5s.
 - **Kafka consumer + auto-create-topics interaction**: auto-create fires on PRODUCE, not SUBSCRIBE. If inventory starts before any order is published, its subscribe errors. Fix: pre-create the topic (the bring-up commands above do this).
+- **Kafka client retry window**: `kafkajs` retries a broker connect ~5 times (~15s total) and then **gives up permanently**, leaving the pod alive but disconnected. If order/inventory pods start before Kafka is reachable (e.g. all manifests applied in one shot), they end up "Ready but broken". Fix: rollout-restart order + inventory after Kafka is proven up. `scripts/deploy.sh` does this automatically as its step 6 — if you bring the stack up manually, do the restart yourself.
 - **Scripts use port-forwards internally** — they assume a working `kubectl` and proper cluster context. No external load balancer needed.
 - **No TestKube content in this repo.** `testkube/` is intentionally empty; orchestration lives outside.
 
