@@ -58,14 +58,19 @@ app.post('/orders', async (req, res) => {
     });
   } catch (err) {
     // Network error, DNS failure, timeout, connection refused — all here.
-    return res.status(502).json({ error: 'auth unreachable', detail: err.message });
+    // Response is intentionally opaque: it must not reveal WHICH upstream
+    // failed, so that diagnosis genuinely requires walking the chain.
+    return res.status(502).json({ error: 'upstream dependency unavailable' });
   }
   if (!authResp.ok) {
-    return res.status(502).json({ error: 'auth errored', authStatus: authResp.status });
+    return res.status(502).json({ error: 'upstream dependency unavailable' });
   }
   const authBody = await authResp.json().catch(() => ({}));
   if (authBody.authorized !== true) {
-    return res.status(403).json({ error: 'not authorized' });
+    // 502 (not 403) — a 403 would still hint at "permissions/auth" and
+    // partially leak the cause. Keep every upstream-related failure
+    // indistinguishable from the caller's perspective.
+    return res.status(502).json({ error: 'upstream dependency unavailable' });
   }
 
   // ---- STEP 2: only now publish. -----------------------------------------
